@@ -1,0 +1,67 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: locust-vllm
+  namespace: vllm
+data:
+  locustfile.py: |
+    from locust import HttpUser, task
+
+    class VLLMUser(HttpUser):
+        wait_time = lambda self: 0
+
+        @task
+        def chat_completion(self):
+            with self.client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "Qwen/Qwen2.5-1.5B-Instruct",
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": "Explain Kubernetes in five concise bullet points."
+                        }
+                    ],
+                    "max_tokens": 128
+                },
+                catch_response=True,
+                timeout=120
+            ) as response:
+                if response.status_code != 200:
+                    response.failure(
+                        f"HTTP {response.status_code}: {response.text[:200]}"
+                    )
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: locust-vllm
+  namespace: vllm
+  labels:
+    app: locust-vllm
+spec:
+  restartPolicy: Never
+
+  containers:
+    - name: locust
+      image: locustio/locust:2.46.5
+      command:
+        - sleep
+        - infinity
+
+      resources:
+        requests:
+          cpu: 250m
+          memory: 256Mi
+        limits:
+          cpu: "1"
+          memory: 1Gi
+
+      volumeMounts:
+        - name: locustfile
+          mountPath: /mnt/locust
+
+  volumes:
+    - name: locustfile
+      configMap:
+        name: locust-vllm

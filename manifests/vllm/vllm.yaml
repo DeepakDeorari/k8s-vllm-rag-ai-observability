@@ -3,72 +3,117 @@ kind: Deployment
 metadata:
   name: vllm
   namespace: vllm
+  labels:
+    app: vllm
+    app.kubernetes.io/name: vllm
+    app.kubernetes.io/instance: primary
+    ai.platform/model: qwen2-5-1-5b
+
 spec:
   replicas: 1
+
   selector:
     matchLabels:
       app: vllm
+
   template:
     metadata:
       labels:
         app: vllm
+        app.kubernetes.io/name: vllm
+        app.kubernetes.io/instance: primary
+        ai.platform/model: qwen2-5-1-5b
+
     spec:
       runtimeClassName: nvidia
+      enableServiceLinks: false
 
       containers:
-      - name: vllm
-        image: vllm/vllm-openai:latest
+        - name: vllm
+          image: vllm/vllm-openai:latest
+          imagePullPolicy: IfNotPresent
 
-        args:
-        - --model
-        - Qwen/Qwen2.5-1.5B-Instruct
-        - --host
-        - 0.0.0.0
-        - --port
-        - "8000"
-        - --gpu-memory-utilization
-        - "0.85"
-        - --max-model-len
-        - "8192"
-        - --enable-auto-tool-choice
-        - --tool-call-parser
-        - hermes
+          args:
+            - --model
+            - Qwen/Qwen2.5-1.5B-Instruct
+            - --host
+            - 0.0.0.0
+            - --port
+            - "8000"
+            - --gpu-memory-utilization
+            - "0.85"
+            - --max-model-len
+            - "8192"
+            - --enable-auto-tool-choice
+            - --tool-call-parser
+            - hermes
 
-        env:
-        - name: HUGGING_FACE_HUB_TOKEN
-          valueFrom:
-            secretKeyRef:
-              name: hf-token
-              key: HF_TOKEN
+          env:
+            - name: HUGGING_FACE_HUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: HF_TOKEN
 
-        ports:
-        - containerPort: 8000
+          ports:
+            - name: http
+              containerPort: 8000
+              protocol: TCP
 
-        resources:
-          limits:
-            nvidia.com/gpu: 1
-            memory: 12Gi
-          requests:
-            cpu: "2"
-            memory: 8Gi
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 60
 
-        volumeMounts:
-        - name: hf-cache
-          mountPath: /root/.cache/huggingface
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 300
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 6
+
+          resources:
+            requests:
+              cpu: "1"
+              memory: 6Gi
+              nvidia.com/gpu: 1
+
+            limits:
+              memory: 12Gi
+              nvidia.com/gpu: 1
+
+          volumeMounts:
+            - name: hf-cache
+              mountPath: /root/.cache/huggingface
 
       volumes:
-      - name: hf-cache
-        persistentVolumeClaim:
-          claimName: hf-cache
+        - name: hf-cache
+          persistentVolumeClaim:
+            claimName: hf-cache
+
 ---
 apiVersion: v1
 kind: Service
 metadata:
   name: vllm
   namespace: vllm
+  labels:
+    app: vllm
+    app.kubernetes.io/name: vllm
+
 spec:
   selector:
     app: vllm
+    app.kubernetes.io/instance: primary
+
   ports:
-  - port: 8000
-    targetPort: 8000
+    - name: http
+      port: 8000
+      targetPort: 8000
+      protocol: TCP

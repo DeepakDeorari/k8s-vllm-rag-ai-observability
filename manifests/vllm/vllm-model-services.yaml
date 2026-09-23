@@ -1,0 +1,32 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-qwen
+  namespace: vllm
+
+spec:
+  selector:
+    app: vllm
+    app.kubernetes.io/instance: primary
+
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-phi3
+  namespace: vllm
+
+spec:
+  selector:
+    app: vllm
+    app.kubernetes.io/instance: secondary
+
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
