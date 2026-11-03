@@ -1,0 +1,36 @@
+FROM rayproject/ray:2.59.0-py312
+
+USER root
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    HF_HUB_DISABLE_TELEMETRY=1
+
+WORKDIR /app
+
+COPY requirements-ray-sre.txt /app/requirements-ray-sre.txt
+
+RUN python -m pip install \
+    --no-cache-dir \
+    torch==2.14.1 \
+    --index-url https://download.pytorch.org/whl/cpu
+
+RUN python -m pip install \
+    --no-cache-dir \
+    -r /app/requirements-ray-sre.txt
+
+RUN python -c "from sentence_transformers import SentenceTransformer; model = SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2'); model.save('/app/models/all-MiniLM-L6-v2')"
+
+COPY tools /app/tools
+
+RUN chown -R ray:users /app
+
+USER ray
+
+ENV PYTHONPATH=/app \
+    EMBEDDING_MODEL=/app/models/all-MiniLM-L6-v2 \
+    TRANSFORMERS_OFFLINE=1 \
+    HF_HUB_OFFLINE=1
+
+WORKDIR /app

@@ -1,0 +1,535 @@
+from typing import Any
+
+from fastapi.testclient import TestClient
+
+import app.langgraph_main as api_module
+
+
+client = TestClient(
+    api_module.app
+)
+
+
+class FakeGraph:
+    """
+    Deterministic replacement for the live LangGraph workflow.
+
+    This test double avoids calling:
+    - Qwen through vLLM
+    - Prometheus
+    - Kubernetes
+    - Qdrant
+
+    The purpose is to test the FastAPI contract independently.
+    """
+
+    def __init__(
+        self,
+        final_state: dict[str, Any],
+    ):
+        self.final_state = final_state
+        self.received_state = None
+
+    def invoke(
+        self,
+        state: dict[str, Any],
+    ) -> dict[str, Any]:
+        self.received_state = state
+
+        return self.final_state
+
+
+def test_health_endpoint():
+    """
+    Verify the lightweight API health endpoint.
+    """
+
+    response = client.get(
+        "/health"
+    )
+
+    assert response.status_code == 200
+
+    assert response.json() == {
+        "status": "healthy",
+        "service": "ai-sre-langgraph-api",
+    }
+
+
+def test_capabilities_endpoint():
+    """
+    Verify that the public capabilities endpoint describes
+    the implemented read-only workflow.
+    """
+
+    response = client.get(
+        "/capabilities"
+    )
+
+    assert response.status_code == 200
+
+    body = response.json()
+
+    assert body["service"] == (
+        "ai-sre-langgraph-api"
+    )
+
+    assert body["read_only"] is True
+
+    assert len(
+        body["capabilities"]
+    ) == 4
+
+    routes = {
+        capability["route"]
+        for capability in body["capabilities"]
+    }
+
+    assert routes == {
+        "cpu",
+        "health",
+        "kubernetes",
+    }
+
+    kubernetes_intents = {
+        capability.get("intent")
+        for capability in body["capabilities"]
+        if capability["route"] == "kubernetes"
+    }
+
+    assert kubernetes_intents == {
+        "restarts",
+        "unhealthy",
+    }
+
+
+def test_empty_question_is_rejected():
+    """
+    Verify that Pydantic rejects an empty question before
+    LangGraph execution.
+    """
+
+    response = client.post(
+        "/investigate",
+        json={
+            "question": "",
+        },
+    )
+
+    assert response.status_code == 422
+
+    body = response.json()
+
+    assert body["detail"]
+
+    assert body["detail"][0]["type"] == (
+        "string_too_short"
+    )
+
+
+def test_short_question_is_rejected():
+    """
+    Verify that questions shorter than three characters are rejected.
+    """
+
+    response = client.post(
+        "/investigate",
+        json={
+            "question": "hi",
+        },
+    )
+
+    assert response.status_code == 422
+
+
+def test_missing_question_is_rejected():
+    """
+    Verify that the question field is required.
+    """
+
+    response = client.post(
+        "/investigate",
+        json={},
+    )
+
+    assert response.status_code == 422
+
+
+def test_cpu_investigation_contract(
+    monkeypatch,
+):
+    """
+    Verify the API response contract for a CPU investigation.
+    """
+
+    fake_graph = FakeGraph(
+        {
+            "question": (
+                "How busy are the processors?"
+            ),
+            "route": "cpu",
+            "final_answer": (
+                "Current Kubernetes node CPU "
+                "utilization:\n"
+                "- 172.31.7.23:9100: 13.18%\n"
+                "- 172.31.6.36:9100: 3.04%"
+            ),
+        }
+    )
+
+    monkeypatch.setattr(
+        api_module,
+        "sre_monitoring_graph",
+        fake_graph,
+    )
+
+    question = (
+        "How busy are the processors?"
+    )
+
+    response = client.post(
+        "/investigate",
+        json={
+            "question": question,
+        },
+    )
+
+    assert response.status_code == 200
+
+    body = response.json()
+
+    assert fake_graph.received_state == {
+        "question": question,
+    }
+
+    assert body["question"] == question
+
+    assert body["route"] == "cpu"
+
+    assert body["kubernetes_intent"] is None
+
+    assert (
+        "172.31.7.23:9100"
+        in body["answer"]
+    )
+
+    assert (
+        "172.31.6.36:9100"
+        in body["answer"]
+    )
+
+    assert body["analysis_valid"] is None
+
+    assert body[
+        "analysis_validation_errors"
+    ] == []
+
+    assert body["retrieved_documents"] == []
+
+    assert isinstance(
+        body["duration_ms"],
+        float,
+    )
+
+    assert body["duration_ms"] >= 0
+
+
+def test_unhealthy_pod_investigation_contract(
+    monkeypatch,
+):
+    """
+    Verify the response contract for current pod-health diagnostics.
+    """
+
+    fake_graph = FakeGraph(
+        {
+            "route": "kubernetes",
+            "kubernetes_intent": "unhealthy",
+            "final_answer": (
+                "Current Kubernetes pod health:\n"
+                "- Total pods inspected: 41\n"
+                "- Currently unhealthy pods: 0\n"
+                "- No currently unhealthy pods were found."
+            ),
+        }
+    )
+
+    monkeypatch.setattr(
+        api_module,
+        "sre_monitoring_graph",
+        fake_graph,
+    )
+
+    question = (
+        "Are any Kubernetes pods unhealthy "
+        "right now?"
+    )
+
+    response = client.post(
+        "/investigate",
+        json={
+            "question": question,
+        },
+    )
+
+    assert response.status_code == 200
+
+    body = response.json()
+
+    assert body["route"] == "kubernetes"
+
+    assert body["kubernetes_intent"] == (
+        "unhealthy"
+    )
+
+    assert (
+        "Currently unhealthy pods: 0"
+        in body["answer"]
+    )
+
+    assert body["analysis_valid"] is None
+
+    assert body["retrieved_documents"] == []
+
+
+def test_restart_investigation_contract(
+    monkeypatch,
+):
+    """
+    Verify the guarded restart-investigation response contract.
+    """
+
+    validation_errors = [
+        (
+            "The required root-cause "
+            "disclaimer is missing."
+        ),
+        (
+            "Unsupported causal speculation "
+            "was found: resource contention"
+        ),
+    ]
+
+    retrieved_documents = [
+        {
+            "id": "runbook-1",
+            "score": 0.7723,
+            "text": (
+                "Runbook: Kubernetes historical "
+                "pod restart investigation."
+            ),
+        },
+        {
+            "id": "runbook-2",
+            "score": 0.6063,
+            "text": (
+                "Runbook: Kubernetes "
+                "CrashLoopBackOff investigation."
+            ),
+        },
+    ]
+
+    fake_graph = FakeGraph(
+        {
+            "route": "kubernetes",
+            "kubernetes_intent": "restarts",
+            "analysis_valid": False,
+            "analysis_validation_errors": (
+                validation_errors
+            ),
+            "retrieved_documents": (
+                retrieved_documents
+            ),
+            "final_answer": (
+                "Kubernetes pod restart investigation:\n"
+                "Root cause cannot be determined "
+                "from the current evidence.\n"
+                "Analysis validation:\n"
+                "- Status: FALLBACK USED"
+            ),
+        }
+    )
+
+    monkeypatch.setattr(
+        api_module,
+        "sre_monitoring_graph",
+        fake_graph,
+    )
+
+    question = (
+        "Show the workloads with the highest "
+        "historical restart counts."
+    )
+
+    response = client.post(
+        "/investigate",
+        json={
+            "question": question,
+        },
+    )
+
+    assert response.status_code == 200
+
+    body = response.json()
+
+    assert body["route"] == "kubernetes"
+
+    assert body["kubernetes_intent"] == (
+        "restarts"
+    )
+
+    assert body["analysis_valid"] is False
+
+    assert body[
+        "analysis_validation_errors"
+    ] == validation_errors
+
+    assert len(
+        body["retrieved_documents"]
+    ) == 2
+
+    assert (
+        body["retrieved_documents"][0]["score"]
+        == 0.7723
+    )
+
+    assert (
+        "Root cause cannot be determined"
+        in body["answer"]
+    )
+
+    assert (
+        "FALLBACK USED"
+        in body["answer"]
+    )
+
+
+def test_unsupported_investigation_contract(
+    monkeypatch,
+):
+    """
+    Verify controlled handling of unsupported requests.
+    """
+
+    fake_graph = FakeGraph(
+        {
+            "route": "unsupported",
+            "final_answer": (
+                "This workflow currently supports "
+                "Kubernetes node CPU usage, "
+                "Prometheus target health, "
+                "historical pod restarts, and "
+                "current unhealthy pod diagnostics."
+            ),
+        }
+    )
+
+    monkeypatch.setattr(
+        api_module,
+        "sre_monitoring_graph",
+        fake_graph,
+    )
+
+    response = client.post(
+        "/investigate",
+        json={
+            "question": (
+                "What is the current GPU temperature?"
+            ),
+        },
+    )
+
+    assert response.status_code == 200
+
+    body = response.json()
+
+    assert body["route"] == "unsupported"
+
+    assert body["kubernetes_intent"] is None
+
+    assert body["analysis_valid"] is None
+
+
+def test_missing_final_answer_returns_500(
+    monkeypatch,
+):
+    """
+    Verify that the API rejects an incomplete graph result.
+    """
+
+    fake_graph = FakeGraph(
+        {
+            "route": "cpu",
+        }
+    )
+
+    monkeypatch.setattr(
+        api_module,
+        "sre_monitoring_graph",
+        fake_graph,
+    )
+
+    response = client.post(
+        "/investigate",
+        json={
+            "question": (
+                "What is the current node CPU usage?"
+            ),
+        },
+    )
+
+    assert response.status_code == 500
+
+    body = response.json()
+
+    assert body["detail"] == (
+        "The investigation workflow returned "
+        "no final answer."
+    )
+
+
+def test_graph_exception_returns_500(
+    monkeypatch,
+):
+    """
+    Verify that unexpected graph failures return a controlled
+    HTTP 500 response without exposing internal exception details.
+    """
+
+    class FailingGraph:
+        def invoke(
+            self,
+            state: dict[str, Any],
+        ) -> dict[str, Any]:
+            raise RuntimeError(
+                "internal test failure"
+            )
+
+    monkeypatch.setattr(
+        api_module,
+        "sre_monitoring_graph",
+        FailingGraph(),
+    )
+
+    response = client.post(
+        "/investigate",
+        json={
+            "question": (
+                "What is the current node CPU usage?"
+            ),
+        },
+    )
+
+    assert response.status_code == 500
+
+    body = response.json()
+
+    assert body["detail"] == (
+        "The investigation workflow failed: "
+        "RuntimeError"
+    )
+
+    assert (
+        "internal test failure"
+        not in body["detail"]
+    )

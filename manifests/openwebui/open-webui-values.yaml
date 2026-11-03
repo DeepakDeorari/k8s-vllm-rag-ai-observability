@@ -16,7 +16,7 @@ extraEnvVars:
     value: "true"
 
   - name: OPENAI_API_BASE_URLS
-    value: "http://vllm.vllm.svc.cluster.local:8000/v1"
+    value: "http://vllm-qwen.vllm.svc.cluster.local:8000/v1;http://vllm-phi3.vllm.svc.cluster.local:8000/v1"
 
   - name: OPENAI_API_KEYS
     value: "dummy"

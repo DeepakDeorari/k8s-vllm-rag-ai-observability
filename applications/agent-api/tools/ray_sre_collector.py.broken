@@ -1,0 +1,453 @@
+import os
+import socket
+import threading
+import time
+from typing import Any
+
+import ray
+
+
+RAY_ADDRESS = os.getenv(
+    "RAY_ADDRESS",
+    (
+        "ray://"
+        "ai-sre-ray-head-svc."
+        "ray-cluster.svc.cluster.local:"
+        "10001"
+    ),
+)
+
+RAY_NAMESPACE = os.getenv(
+    "RAY_NAMESPACE",
+    "ai-sre-platform",
+)
+
+KNOWLEDGE_ACTOR_NAME = os.getenv(
+    "RAY_KNOWLEDGE_ACTOR_NAME",
+    "ai-sre-knowledge-v1",
+)
+
+DEFAULT_KNOWLEDGE_QUERY = (
+    "How should Kubernetes workload health, "
+    "pod restarts, Prometheus target failures, "
+    "and node CPU problems be investigated?"
+)
+
+_ray_initialization_lock = threading.Lock()
+
+
+def ensure_ray_connection() -> None:
+    """
+    Connect the caller to the existing KubeRay cluster.
+
+    This function must never start an independent local Ray runtime.
+    The configured address must therefore be explicit.
+    """
+
+    if ray.is_initialized():
+        return
+
+    with _ray_initialization_lock:
+        if ray.is_initialized():
+            return
+
+        if not RAY_ADDRESS:
+            raise RuntimeError(
+                "RAY_ADDRESS must reference the existing "
+                "KubeRay cluster."
+            )
+
+        ray.init(
+            address=RAY_ADDRESS,
+            namespace=RAY_NAMESPACE,
+            ignore_reinit_error=True,
+        )
+
+
+def execution_metadata() -> dict[str, Any]:
+    """
+    Return the Ray and container execution location.
+    """
+
+    context = ray.get_runtime_context()
+
+    hostname = socket.gethostname()
+
+    return {
+        "hostname": hostname,
+        "pod_ip": socket.gethostbyname(
+            hostname
+        ),
+        "pid": os.getpid(),
+        "ray_node_id": context.get_node_id(),
+        "assigned_resources": (
+            context.get_assigned_resources()
+        ),
+    }
+
+
+@ray.remote(
+    num_cpus=0.25,
+    max_retries=3,
+)
+def collect_prometheus_health() -> dict[str, Any]:
+    """
+    Collect Prometheus scrape-target health through a Ray Task.
+    """
+
+    from tools.prometheus_health import (
+        get_prometheus_target_health,
+    )
+
+    start = time.perf_counter()
+
+    evidence = (
+        get_prometheus_target_health()
+    )
+
+    return {
+        "source": "prometheus_health",
+        "execution": execution_metadata(),
+        "duration_seconds": round(
+            time.perf_counter() - start,
+            4,
+        ),
+        "evidence": evidence,
+    }
+
+
+@ray.remote(
+    num_cpus=0.25,
+    max_retries=3,
+)
+def collect_prometheus_cpu() -> dict[str, Any]:
+    """
+    Collect Kubernetes node CPU utilization through a Ray Task.
+    """
+
+    from tools.prometheus_cpu import (
+        get_current_node_cpu_percent,
+    )
+
+    start = time.perf_counter()
+
+    evidence = (
+        get_current_node_cpu_percent()
+    )
+
+    return {
+        "source": "prometheus_cpu",
+        "execution": execution_metadata(),
+        "duration_seconds": round(
+            time.perf_counter() - start,
+            4,
+        ),
+        "evidence": evidence,
+    }
+
+
+@ray.remote(
+    num_cpus=0.25,
+    max_retries=3,
+)
+def collect_kubernetes_health() -> dict[str, Any]:
+    """
+    Collect current unhealthy-pod evidence through a Ray Task.
+    """
+
+    from tools.kubernetes_pods import (
+        get_unhealthy_pods,
+    )
+
+    start = time.perf_counter()
+
+    evidence = get_unhealthy_pods()
+
+    return {
+        "source": "kubernetes_health",
+        "execution": execution_metadata(),
+        "duration_seconds": round(
+            time.perf_counter() - start,
+            4,
+        ),
+        "evidence": evidence,
+    }
+
+
+@ray.remote(
+    num_cpus=0.25,
+    max_retries=3,
+)
+def collect_kubernetes_restarts() -> dict[str, Any]:
+    """
+    Collect historical pod-restart evidence through a Ray Task.
+    """
+
+    from tools.kubernetes_pods import (
+        get_restarting_pods,
+    )
+
+    start = time.perf_counter()
+
+    evidence = get_restarting_pods()
+
+    return {
+        "source": "kubernetes_restarts",
+        "execution": execution_metadata(),
+        "duration_seconds": round(
+            time.perf_counter() - start,
+            4,
+        ),
+        "evidence": evidence,
+    }
+
+
+@ray.remote(
+    num_cpus=0.5,
+    max_restarts=2,
+    max_task_retries=2,
+)
+class KnowledgeActor:
+    """  """
+    Persistent Ray Actor for MiniLM and Qdrant retrieval.
+
+    Runtime resources are reconstructed if the Actor restarts.
+    No irreplaceable incident state is stored in this Actor.
+    """
+
+    def __init__(self) -> None:
+        initialization_start = (
+            time.perf_counter()
+        )
+
+        from tools.qdrant_retriever import (
+            retrieve_documents,
+        )
+
+        self.retrieve_documents = (
+            retrieve_documents
+        )
+
+        self.hostname = socket.gethostname()
+
+        self.pod_ip = socket.gethostbyname(
+            self.hostname
+        )
+
+        self.pid = os.getpid()
+
+        self.retrieval_count = 0
+
+        self.initialization_seconds = round(
+            (
+                time.perf_counter()
+                - initialization_start
+            ),
+            4,
+        )
+
+    def health(self) -> dict[str, Any\]:
+        return {
+            "status": "ready",
+            "hostname": self.hostname,
+            "pod_ip": self.pod_ip,
+         d": self.pid,
+            "initialization_seconds": (
+                self.initialization_seconds
+            ),
+            "retrieval_count": (
+                self.retrieval_count
+            ),
+        }
+
+    def retrieve(
+        self,
+        question: str,
+        limit: int = 3,
+    ) -> dict[str, Any]:
+        start = time.perf_counter()
+
+        evidence = self.retrieve_documents(
+            question=question,
+            limit=limit,
+        )
+
+        self.retrieval_count += 1
+
+        return {
+            "source": "knowledge",
+            "execution": {
+                "hostname": self.hostname,
+                "pod_ip": self.pod_ip,
+                "pid": self.pid,
+                "actor_name": (
+                    KNOWLEDGE_ACTOR_NAME
+                ),
+            },
+            "duration_seconds": round(
+                time.perf_counter() - start,
+                4,
+            ),
+            "retrieval_count": (
+                self.retrieval_count
+            ),
+            "evidence": evidence,
+        }
+
+
+def get_knowledge_actor():
+    """
+    Get or create one named detached KnowledgeActor.
+
+    The Actor persists across API requests and keeps MiniLM loaded.
+    """
+
+    ensure_ray_connection()
+
+    return KnowledgeActor.options(
+        name=KNOWLEDGE_ACTOR_NAME,
+        lifetime="detached",
+        get_if_exists=True,
+    ).remote()
+
+
+def collect_distributed_sre_evidence(
+    question: str,
+    timeout_seconds: float = 60.0,
+) -> dict[str, Any]:
+    """
+    Collect broad SRE evidence through the existing KubeRay cluster.
+
+    Each operation is submitted before any result is awaited.
+    Failures are recorded per source so one unavailable dependency
+    does not discard all other evidence.
+    """
+
+    ensure_ray_connection()
+
+    stripped_question = question.strip()
+
+    retrieval_question = (
+        stripped_question
+        if stripped_question
+        else DEFAULT_KNOWLEDGE_QUERY
+    )
+
+    investigation_start = (
+        time.perf_counter()
+    )
+
+    knowledge_actor = (
+        get_knowledge_actor()
+    )
+
+    references = {
+        "prometheus_health": (
+            collect_prometheus_health.remote()
+        ),
+        "prometheus_cpu": (
+            collect_prometheus_cpu.remote()
+        ),
+        "kubernetes_health": (
+            collect_kubernetes_health.remote()
+        ),
+        "kubernetes_restarts": (
+            collect_kubernetes_restarts.remote()
+        ),
+        "knowledge": (
+            knowledge_actor.retrieve.remote(
+                retrieval_question,
+                3,
+            )
+        ),
+    }
+
+    results: dict[str, Any] = {}
+    errors: list[str] = []
+
+    for source, reference in references.items():
+        try:
+            results[source] = ray.get(
+                reference,
+                timeout=timeout_seconds,
+            )
+
+        except Exception as exc:
+            error_message = (
+                f"{source}: "
+                f"{type(exc).__name__}: {exc}"
+            )
+
+            errors.append(
+                error_message
+            )
+
+            results[source] = {
+                "source": source,
+                "execution": {},
+                "duration_seconds": None,
+                "evidence": {},
+                "error": error_message,
+            }
+
+    total_duration_seconds = round(
+        (
+            time.perf_counter()
+            - investigation_start
+        ),
+        4,
+    )
+
+    successful_sources = [
+        source
+        for source, result in results.items()
+        if not result.get("error")
+    ]
+
+    execution_metadata_by_source = {
+        source: result.get(
+            "execution",
+            {},
+        )
+        for source, result in results.items()
+    }
+
+    retrieved_documents = (
+        results.get(
+            "knowledge",
+            {},
+        )
+        .get(
+            "evidence",
+            {},
+        )
+        .get(
+            "documents",
+            [],
+        )
+    )
+
+    return {
+        "question": stripped_question,
+        "ray_address": RAY_ADDRESS,
+        "ray_namespace": RAY_NAMESPACE,
+        "results": results,
+        "successful_sources": (
+            successful_sources
+        ),
+        "source_count": len(results),
+        "successful_source_count": len(
+            successful_sources
+        ),
+        "errors": errors,
+        "valid": len(errors) == 0,
+        "duration_seconds": (
+            total_duration_seconds
+        ),
+        "execution_metadata": (
+            execution_metadata_by_source
+        ),
+        "retrieved_documents": (
+            retrieved_documents
+        ),
+    }
