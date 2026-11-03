@@ -1,0 +1,107 @@
+apiVersion: ray.io/v1
+kind: RayCluster
+metadata:
+  name: ai-sre-ray
+  namespace: ray-cluster
+  labels:
+    app.kubernetes.io/name: ai-sre-ray
+    app.kubernetes.io/part-of: ai-sre-platform
+
+spec:
+  rayVersion: "2.59.0"
+
+  enableInTreeAutoscaling: false
+
+  headGroupSpec:
+    rayStartParams:
+      dashboard-host: "0.0.0.0"
+      num-cpus: "0"
+
+    template:
+      metadata:
+        labels:
+          app.kubernetes.io/name: ai-sre-ray
+          app.kubernetes.io/component: head
+
+      spec:
+        serviceAccountName: ai-sre-ray
+        nodeSelector:
+          kubernetes.io/hostname: ip-172-31-7-23
+
+        containers:
+          - name: ray-head
+            image: ai-sre-ray:0.1.1
+            imagePullPolicy: Never
+
+            ports:
+              - name: gcs
+                containerPort: 6379
+                protocol: TCP
+
+              - name: dashboard
+                containerPort: 8265
+                protocol: TCP
+
+              - name: client
+                containerPort: 10001
+                protocol: TCP
+
+              - name: metrics
+                containerPort: 8080
+                protocol: TCP
+
+            resources:
+              requests:
+                cpu: "250m"
+                memory: "1Gi"
+
+              limits:
+                cpu: "500m"
+                memory: "2Gi"
+
+            securityContext:
+              allowPrivilegeEscalation: false
+              capabilities:
+                drop:
+                  - ALL
+
+  workerGroupSpecs:
+    - groupName: cpu-workers
+
+      replicas: 1
+      minReplicas: 1
+      maxReplicas: 1
+
+      rayStartParams:
+        num-cpus: "2"
+
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: ai-sre-ray
+            app.kubernetes.io/component: worker
+
+        spec:
+          serviceAccountName: ai-sre-ray
+          nodeSelector:
+            kubernetes.io/hostname: ip-172-31-6-36
+
+          containers:
+            - name: ray-worker
+              image: ai-sre-ray:0.1.1
+              imagePullPolicy: Never
+
+              resources:
+                requests:
+                  cpu: "1"
+                  memory: "1Gi"
+
+                limits:
+                  cpu: "2"
+                  memory: "2Gi"
+
+              securityContext:
+                allowPrivilegeEscalation: false
+                capabilities:
+                  drop:
+                    - ALL

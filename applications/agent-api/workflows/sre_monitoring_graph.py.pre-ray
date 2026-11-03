@@ -1,0 +1,1855 @@
+from typing import Literal
+from typing import TypedDict
+
+from langchain_openai import ChatOpenAI
+from langgraph.graph import END
+from langgraph.graph import START
+from langgraph.graph import StateGraph
+
+from config.langgraph_models import (
+    QWEN_API_KEY,
+    QWEN_BASE_URL,
+    QWEN_MODEL,
+)
+from tools.kubernetes_pods import (
+    get_restarting_pods,
+    get_unhealthy_pods,
+)
+from tools.prometheus_cpu import (
+    get_current_node_cpu_percent,
+)
+from tools.prometheus_health import (
+    get_prometheus_target_health,
+)
+from tools.qdrant_retriever import (
+    retrieve_documents,
+)
+
+
+class SreGraphState(TypedDict, total=False):
+    """
+    Shared state for the SRE monitoring workflow.
+    """
+
+    question: str
+
+    route: Literal[
+        "cpu",
+        "health",
+        "kubernetes",
+        "unsupported",
+    ]
+
+    kubernetes_intent: Literal[
+        "restarts",
+        "unhealthy",
+        "unsupported",
+    ]
+
+    classification_raw: str
+    classification_reason: str
+
+    kubernetes_classification_raw: str
+    kubernetes_classification_reason: str
+
+    cpu_metrics: dict
+    health_metrics: dict
+    restart_metrics: dict
+    unhealthy_metrics: dict
+
+    retrieval_query: str
+    retrieved_documents: list
+    retrieval_count: int
+    
+    analysis: str
+    analysis_error: str
+
+    analysis_valid: bool
+    analysis_validation_errors: list
+    validated_analysis: str
+
+    final_answer: str
+    error: str
+
+
+classifier_llm = ChatOpenAI(
+    model=QWEN_MODEL,
+    base_url=QWEN_BASE_URL,
+    api_key=QWEN_API_KEY,
+    temperature=0,
+    max_tokens=30,
+    timeout=30,
+    max_retries=2,
+)
+
+analysis_llm = ChatOpenAI(
+    model=QWEN_MODEL,
+    base_url=QWEN_BASE_URL,
+    api_key=QWEN_API_KEY,
+    temperature=0,
+    max_tokens=600,
+    timeout=60,
+    max_retries=2,
+)
+
+
+def normalize_primary_route(
+    model_output: str,
+    question: str,
+) -> Literal[
+    "cpu",
+    "health",
+    "kubernetes",
+    "unsupported",
+]:
+    """
+    Normalize Qwen output into a valid primary route.
+
+    The function uses an explicit allowlist of approved model-output
+    aliases. It also uses the original question only when an output
+    such as UNHEALTHY is ambiguous between Prometheus health and
+    Kubernetes workload health.
+
+    Anything unrecognized fails closed to unsupported.
+    """
+
+    cleaned_output = (
+        model_output
+        .strip()
+        .upper()
+        .replace("-", "_")
+        .replace(" ", "_")
+    )
+
+    cleaned_question = question.strip().lower()
+
+    cpu_aliases = {
+        "CPU",
+        "CPU_USAGE",
+        "CPU_UTILIZATION",
+        "NODE_CPU",
+        "NODE_CPU_USAGE",
+        "NODE_CPU_UTILIZATION",
+        "KUBERNETES_CPU",
+        "KUBERNETES_NODE_CPU",
+        "KUBERNETES_NODE_CPU_USAGE",
+        "KUBERNETES_NODE_CPU_UTILIZATION",
+        "PROCESSOR_USAGE",
+        "PROCESSOR_UTILIZATION",
+        "COMPUTE_USAGE",
+        "COMPUTE_UTILIZATION",
+        "CLUSTER_CPU_USAGE",
+        "CLUSTER_CPU_UTILIZATION",
+    }
+
+    health_aliases = {
+        "HEALTH",
+        "PROMETHEUS_HEALTH",
+        "TARGET_HEALTH",
+        "PROMETHEUS_TARGET_HEALTH",
+        "SCRAPE_HEALTH",
+        "PROMETHEUS_SCRAPE_HEALTH",
+        "TARGETS",
+    }
+
+    kubernetes_aliases = {
+        "KUBERNETES",
+        "K8S",
+        "RESTARTS",
+        "POD_RESTARTS",
+        "CONTAINER_RESTARTS",
+        "HISTORICAL_RESTARTS",
+        "HISTORICAL_POD_RESTARTS",
+        "HISTORICAL_CONTAINER_RESTARTS",
+        "RESTART_COUNT",
+        "RESTART_COUNTS",
+        "CRASHLOOPBACKOFF",
+        "CRASH_LOOP_BACK_OFF",
+        "IMAGEPULLBACKOFF",
+        "IMAGE_PULL_BACK_OFF",
+        "NOT_READY",
+        "PENDING_PODS",
+        "FAILED_PODS",
+    }
+
+    if cleaned_output in cpu_aliases:
+        return "cpu"
+
+    if cleaned_output in health_aliases:
+        return "health"
+
+    if cleaned_output in kubernetes_aliases:
+        return "kubernetes"
+
+    if cleaned_output == "UNHEALTHY":
+        prometheus_terms = (
+            "prometheus",
+            "monitoring target",
+            "monitoring targets",
+            "scrape target",
+            "scrape targets",
+        )
+
+        kubernetes_terms = (
+            "kubernetes",
+            "pod",
+            "pods",
+            "container",
+            "containers",
+            "workload",
+            "workloads",
+            "crashloopbackoff",
+            "imagepullbackoff",
+            "not ready",
+            "pending",
+            "failed",
+        )
+
+        if any(
+            term in cleaned_question
+            for term in prometheus_terms
+        ):
+            return "health"
+
+        if any(
+            term in cleaned_question
+            for term in kubernetes_terms
+        ):
+            return "kubernetes"
+
+        return "unsupported"
+
+    if cleaned_output == "UNSUPPORTED":
+        return "unsupported"
+
+    return "unsupported"
+
+def normalize_kubernetes_intent(
+    model_output: str,
+) -> Literal[
+    "restarts",
+    "unhealthy",
+    "unsupported",
+]:
+    """
+    Normalize Qwen output for the Kubernetes diagnostic branch.
+
+    Approved restart-related aliases are mapped to the internal
+    'restarts' route.
+
+    Approved current-health aliases are mapped to the internal
+    'unhealthy' route.
+
+    Anything else fails closed to 'unsupported'.
+    """
+
+    cleaned_output = (
+        model_output
+        .strip()
+        .upper()
+        .replace("-", "_")
+        .replace(" ", "_")
+    )
+
+    restart_aliases = {
+        "RESTARTS",
+        "POD_RESTARTS",
+        "CONTAINER_RESTARTS",
+        "HISTORICAL_RESTARTS",
+        "HISTORICAL_POD_RESTARTS",
+        "HISTORICAL_CONTAINER_RESTARTS",
+        "RESTART_COUNT",
+        "RESTART_COUNTS",
+    }
+
+    unhealthy_aliases = {
+        "UNHEALTHY",
+        "UNHEALTHY_PODS",
+        "POD_HEALTH",
+        "CURRENT_POD_HEALTH",
+        "CRASHLOOPBACKOFF",
+        "CRASH_LOOP_BACK_OFF",
+        "IMAGEPULLBACKOFF",
+        "IMAGE_PULL_BACK_OFF",
+        "NOT_READY",
+        "PENDING_PODS",
+        "FAILED_PODS",
+    }
+
+    if cleaned_output in restart_aliases:
+        return "restarts"
+
+    if cleaned_output in unhealthy_aliases:
+        return "unhealthy"
+
+    if cleaned_output == "UNSUPPORTED":
+        return "unsupported"
+
+    return "unsupported"
+
+
+def classify_primary_intent_node(
+    state: SreGraphState,
+) -> dict:
+    """
+    Use Qwen through vLLM to classify the top-level request.
+
+    Qwen can select only CPU, HEALTH, KUBERNETES,
+    or UNSUPPORTED.
+    """
+
+    question = state.get("question", "").strip()
+
+    if not question:
+        return {
+            "route": "unsupported",
+            "classification_raw": "",
+            "classification_reason": (
+                "The user question was empty."
+            ),
+        }
+
+    messages = [
+        (
+            "system",
+            (
+                "You are the primary intent classifier for an "
+                "SRE diagnostic workflow.\n\n"
+                "Classify the user question into exactly one "
+                "of these categories:\n\n"
+                "CPU\n"
+                "- Kubernetes node CPU utilization\n"
+                "- Processor usage on cluster nodes\n"
+                "- Compute utilization of nodes\n\n"
+                "HEALTH\n"
+                "- Prometheus scrape-target health\n"
+                "- Whether Prometheus targets are UP or DOWN\n"
+                "- Monitoring target reachability\n\n"
+                "KUBERNETES\n"
+                "- Pod restarts\n"
+                "- CrashLoopBackOff\n"
+                "- ImagePullBackOff\n"
+                "- Pending or failed pods\n"
+                "- Containers that are not ready\n"
+                "- Currently unhealthy Kubernetes workloads\n\n"
+                "UNSUPPORTED\n"
+                "- Node memory utilization\n"
+                "- GPU utilization or GPU temperature\n"
+                "- Application logs\n"
+                "- Questions outside the supported categories\n\n"
+                "Return exactly one of these values:\n"
+                "RESTARTS\n"
+                "UNHEALTHY\n"
+                "UNSUPPORTED\n\n"
+
+                "Examples:\n"
+                "Which pods have restarted? -> RESTARTS\n"
+                "Show historical container restart counts. -> RESTARTS\n"
+                "Which workloads restarted most often? -> RESTARTS\n"
+                "Are any pods unhealthy now? -> UNHEALTHY\n"
+                "Are any pods in CrashLoopBackOff? -> UNHEALTHY\n"
+                "Are any containers not ready? -> UNHEALTHY\n\n"
+
+                "Do not return HISTORICAL_CONTAINER_RESTARTS.\n"
+                "Do not create a new category.\n"
+                "Do not explain the answer.\n"
+                "Return only RESTARTS, UNHEALTHY, or UNSUPPORTED."
+            ),
+        ),
+        (
+            "human",
+            question,
+        ),
+    ]
+
+    try:
+        response = classifier_llm.invoke(messages)
+
+        raw_output = str(
+            response.content
+        ).strip()
+
+        route = normalize_primary_route(
+            raw_output,
+            question,
+        )
+
+        return {
+            "route": route,
+            "classification_raw": raw_output,
+            "classification_reason": (
+                "Primary route selected by Qwen "
+                "through vLLM."
+            ),
+        }
+
+    except Exception as exc:
+        return {
+            "route": "unsupported",
+            "classification_raw": "",
+            "classification_reason": (
+                "Primary classification failed: "
+                f"{type(exc).__name__}: {exc}"
+            ),
+            "error": (
+                "Primary question classification failed."
+            ),
+        }
+
+
+def route_primary_intent(
+    state: SreGraphState,
+) -> Literal[
+    "collect_cpu_metrics",
+    "collect_health_metrics",
+    "classify_kubernetes_intent",
+    "unsupported_question",
+]:
+    """
+    Select the next graph node from the primary route.
+    """
+
+    route = state.get(
+        "route",
+        "unsupported",
+    )
+
+    if route == "cpu":
+        return "collect_cpu_metrics"
+
+    if route == "health":
+        return "collect_health_metrics"
+
+    if route == "kubernetes":
+        return "classify_kubernetes_intent"
+
+    return "unsupported_question"
+
+
+def classify_kubernetes_intent_node(
+    state: SreGraphState,
+) -> dict:
+    """
+    Classify a Kubernetes question into restart-history or
+    current unhealthy-state diagnostics.
+    """
+
+    question = state.get("question", "").strip()
+
+    if not question:
+        return {
+            "kubernetes_intent": "unsupported",
+            "kubernetes_classification_raw": "",
+            "kubernetes_classification_reason": (
+                "The Kubernetes question was empty."
+            ),
+        }
+
+    messages = [
+        (
+            "system",
+            (
+                "You are a Kubernetes diagnostic intent "
+                "classifier.\n\n"
+                "Classify the question into exactly one "
+                "of these categories:\n\n"
+                "RESTARTS\n"
+                "- Which pods have restarted\n"
+                "- Restart counts\n"
+                "- Historical container restarts\n"
+                "- Workloads with the most restarts\n\n"
+                "UNHEALTHY\n"
+                "- Pods unhealthy right now\n"
+                "- CrashLoopBackOff\n"
+                "- ImagePullBackOff\n"
+                "- Containers not ready\n"
+                "- Pending, failed, or unknown pods\n"
+                "- Currently failing workloads\n\n"
+                "UNSUPPORTED\n"
+                "- Kubernetes questions outside these two "
+                "diagnostic capabilities\n\n"
+                "Return only one word:\n"
+                "RESTARTS\n"
+                "UNHEALTHY\n"
+                "UNSUPPORTED\n\n"
+                "Do not explain the answer."
+            ),
+        ),
+        (
+            "human",
+            question,
+        ),
+    ]
+
+    try:
+        response = classifier_llm.invoke(messages)
+
+        raw_output = str(
+            response.content
+        ).strip()
+
+        kubernetes_intent = (
+            normalize_kubernetes_intent(
+                raw_output
+            )
+        )
+
+        return {
+            "kubernetes_intent": kubernetes_intent,
+            "kubernetes_classification_raw": (
+                raw_output
+            ),
+            "kubernetes_classification_reason": (
+                "Kubernetes sub-route selected by "
+                "Qwen through vLLM."
+            ),
+        }
+
+    except Exception as exc:
+        return {
+            "kubernetes_intent": "unsupported",
+            "kubernetes_classification_raw": "",
+            "kubernetes_classification_reason": (
+                "Kubernetes classification failed: "
+                f"{type(exc).__name__}: {exc}"
+            ),
+            "error": (
+                "Kubernetes question classification failed."
+            ),
+        }
+
+
+def route_kubernetes_intent(
+    state: SreGraphState,
+) -> Literal[
+    "collect_restart_metrics",
+    "collect_unhealthy_metrics",
+    "unsupported_question",
+]:
+    """
+    Route execution within the Kubernetes diagnostic branch.
+    """
+
+    kubernetes_intent = state.get(
+        "kubernetes_intent",
+        "unsupported",
+    )
+
+    if kubernetes_intent == "restarts":
+        return "collect_restart_metrics"
+
+    if kubernetes_intent == "unhealthy":
+        return "collect_unhealthy_metrics"
+
+    return "unsupported_question"
+
+
+def collect_cpu_metrics_node(
+    state: SreGraphState,
+) -> dict:
+    """
+    Collect validated Kubernetes node CPU metrics.
+    """
+
+    try:
+        return {
+            "cpu_metrics": (
+                get_current_node_cpu_percent()
+            )
+        }
+
+    except Exception as exc:
+        return {
+            "error": (
+                "CPU metric collection failed: "
+                f"{type(exc).__name__}: {exc}"
+            )
+        }
+
+
+def collect_health_metrics_node(
+    state: SreGraphState,
+) -> dict:
+    """
+    Collect current Prometheus target health.
+    """
+
+    try:
+        return {
+            "health_metrics": (
+                get_prometheus_target_health()
+            )
+        }
+
+    except Exception as exc:
+        return {
+            "error": (
+                "Prometheus target-health collection "
+                f"failed: {type(exc).__name__}: {exc}"
+            )
+        }
+
+
+def collect_restart_metrics_node(
+    state: SreGraphState,
+) -> dict:
+    """
+    Collect historical Kubernetes pod restart data.
+    """
+
+    try:
+        return {
+            "restart_metrics": (
+                get_restarting_pods()
+            )
+        }
+
+    except Exception as exc:
+        return {
+            "error": (
+                "Kubernetes restart diagnostics failed: "
+                f"{type(exc).__name__}: {exc}"
+            )
+        }
+
+def build_restart_retrieval_query_node(
+    state: SreGraphState,
+) -> dict:
+    """
+    Build a Qdrant retrieval query using both the user's question
+    and the structured Kubernetes restart evidence.
+
+    Only a compact summary of the top restart observations is used.
+    The complete Kubernetes evidence remains separately preserved
+    in graph state.
+    """
+
+    if state.get("error"):
+        return {
+            "retrieval_query": "",
+        }
+
+    question = state.get(
+        "question",
+        "",
+    ).strip()
+
+    restart_metrics = state.get(
+        "restart_metrics",
+        {},
+    )
+
+    total_pods = restart_metrics.get(
+        "total_pod_count",
+        0,
+    )
+
+    restarting_count = restart_metrics.get(
+        "restarting_pod_count",
+        0,
+    )
+
+    restarting_pods = restart_metrics.get(
+        "restarting_pods",
+        [],
+    )
+
+    query_parts = [
+        "Kubernetes pod restart investigation.",
+        f"User question: {question}",
+        f"Total pods inspected: {total_pods}.",
+        (
+            "Pods with historical container restarts: "
+            f"{restarting_count}."
+        ),
+    ]
+
+    if restarting_pods:
+        query_parts.append(
+            "Highest restart workloads:"
+        )
+
+        for pod in restarting_pods[:3]:
+            query_parts.append(
+                (
+                    f"{pod.get('namespace')}/"
+                    f"{pod.get('pod')} "
+                    f"has {pod.get('total_restarts')} "
+                    "accumulated restarts, "
+                    f"phase {pod.get('phase')}, "
+                    f"scheduled on {pod.get('node')}."
+                )
+            )
+    else:
+        query_parts.append(
+            "No pods have recorded container restarts."
+        )
+
+    retrieval_query = " ".join(
+        query_parts
+    )
+
+    return {
+        "retrieval_query": retrieval_query,
+    }
+
+def retrieve_restart_knowledge_node(
+    state: SreGraphState,
+) -> dict:
+    """
+    Retrieve unique platform knowledge related to the observed
+    Kubernetes restart evidence.
+    """
+
+    if state.get("error"):
+        return {
+            "retrieved_documents": [],
+            "retrieval_count": 0,
+        }
+
+    retrieval_query = state.get(
+        "retrieval_query",
+        "",
+    ).strip()
+
+    if not retrieval_query:
+        return {
+            "retrieved_documents": [],
+            "retrieval_count": 0,
+            "error": (
+                "Knowledge retrieval could not run because "
+                "the retrieval query was empty."
+            ),
+        }
+
+    try:
+        result = retrieve_documents(
+            question=retrieval_query,
+            limit=3,
+        )
+
+        return {
+            "retrieved_documents": result.get(
+                "documents",
+                [],
+            ),
+            "retrieval_count": result.get(
+                "result_count",
+                0,
+            ),
+        }
+
+    except Exception as exc:
+        return {
+            "retrieved_documents": [],
+            "retrieval_count": 0,
+            "error": (
+                "Qdrant knowledge retrieval failed: "
+                f"{type(exc).__name__}: {exc}"
+            ),
+        }
+
+def analyze_restart_evidence_node(
+    state: SreGraphState,
+) -> dict:
+    """
+    Use Qwen through vLLM to analyze Kubernetes restart evidence
+    together with relevant Qdrant knowledge.
+
+    Exact Kubernetes values remain stored separately in graph state.
+    This node provides interpretation only.
+
+    The model must not invent causes, alter values, or claim that
+    historical restarts prove a current incident.
+    """
+
+    if state.get("error"):
+        return {
+            "analysis": "",
+            "analysis_error": (
+                "Analysis was skipped because an earlier "
+                "workflow step failed."
+            ),
+        }
+
+    question = state.get(
+        "question",
+        "",
+    ).strip()
+
+    restart_metrics = state.get(
+        "restart_metrics",
+        {},
+    )
+
+    total_pods = restart_metrics.get(
+        "total_pod_count",
+        0,
+    )
+
+    restarting_count = restart_metrics.get(
+        "restarting_pod_count",
+        0,
+    )
+
+    restarting_pods = restart_metrics.get(
+        "restarting_pods",
+        [],
+    )
+
+    retrieved_documents = state.get(
+        "retrieved_documents",
+        [],
+    )
+
+    evidence_lines = [
+        f"Total pods inspected: {total_pods}",
+        (
+            "Pods with one or more historical "
+            f"container restarts: {restarting_count}"
+        ),
+    ]
+
+    if restarting_pods:
+        evidence_lines.append(
+            "Highest restart workloads:"
+        )
+
+        for pod in restarting_pods[:5]:
+            evidence_lines.append(
+                (
+                    f"- {pod.get('namespace')}/"
+                    f"{pod.get('pod')} | "
+                    f"restart_count="
+                    f"{pod.get('total_restarts')} | "
+                    f"phase={pod.get('phase')} | "
+                    f"node={pod.get('node')}"
+                )
+            )
+    else:
+        evidence_lines.append(
+            "No pods have recorded container restarts."
+        )
+
+    knowledge_lines = []
+
+    for index, document in enumerate(
+        retrieved_documents,
+        start=1,
+    ):
+        knowledge_lines.append(
+            (
+                f"{index}. "
+                f"Similarity={document.get('score')} | "
+                f"{document.get('text')}"
+            )
+        )
+
+    if not knowledge_lines:
+        knowledge_lines.append(
+            "No relevant runbook documents were retrieved."
+        )
+
+    evidence_text = "\n".join(
+        evidence_lines
+    )
+
+    knowledge_text = "\n".join(
+        knowledge_lines
+    )
+
+    messages = [
+        (
+            "system",
+(
+    "You are a read-only Kubernetes SRE analysis "
+    "assistant.\n\n"
+
+    "Your analysis must be grounded strictly in the supplied "
+    "live Kubernetes evidence and retrieved platform knowledge.\n\n"
+
+    "CRITICAL RULES:\n"
+    "1. Never invent or assume a root cause.\n"
+    "2. Never list hypothetical causes unless a supplied "
+    "document explicitly supports them and the live evidence "
+    "is consistent with them.\n"
+    "3. Do not infer CPU pressure, memory pressure, network "
+    "problems, application bugs, configuration problems, "
+    "probe failures, or resource exhaustion unless the live "
+    "evidence explicitly demonstrates that condition.\n"
+    "4. Historical restart counts alone do not prove that a "
+    "workload is currently unhealthy.\n"
+    "5. Preserve exact pod names, namespaces, node names, "
+    "phases, and restart counts from the supplied evidence.\n"
+    "6. Clearly distinguish facts from recommended checks.\n"
+    "7. Recommendations must be read-only verification steps.\n"
+    "8. Never recommend deleting, restarting, scaling, "
+    "patching, or modifying a workload.\n"
+    "9. If the root cause cannot be determined from the "
+    "supplied evidence, explicitly say: "
+    "'Root cause cannot be determined from the current evidence.'\n"
+    "10. Be concise. Do not produce long explanations.\n\n"
+
+    "Return exactly these four sections:\n\n"
+
+    "Assessment:\n"
+    "- Maximum 3 bullet points containing observed facts only.\n\n"
+
+    "Evidence interpretation:\n"
+    "- Maximum 3 bullet points.\n"
+    "- Explain only what the evidence supports.\n\n"
+
+    "Recommended verification:\n"
+    "- Maximum 5 read-only checks derived from the retrieved "
+    "runbook.\n\n"
+
+    "Conclusion:\n"
+    "- Maximum 2 sentences.\n"
+    "- State whether an active incident or root cause can "
+    "actually be established."
+),
+        ),
+        (
+            "human",
+            (
+                f"User question:\n{question}\n\n"
+
+                "Live Kubernetes evidence:\n"
+                f"{evidence_text}\n\n"
+
+                "Retrieved platform knowledge:\n"
+                f"{knowledge_text}"
+            ),
+        ),
+    ]
+
+    try:
+        response = analysis_llm.invoke(
+            messages
+        )
+
+        analysis = str(
+            response.content
+        ).strip()
+
+        if not analysis:
+            return {
+                "analysis": "",
+                "analysis_error": (
+                    "Qwen returned an empty analysis."
+                ),
+            }
+
+        return {
+            "analysis": analysis,
+            "analysis_error": "",
+        }
+
+    except Exception as exc:
+        return {
+            "analysis": "",
+            "analysis_error": (
+                "Grounded analysis failed: "
+                f"{type(exc).__name__}: {exc}"
+            ),
+        }
+
+def build_safe_restart_analysis(
+    state: SreGraphState,
+) -> str:
+    """
+    Build a deterministic fallback analysis from structured
+    Kubernetes evidence.
+
+    This function does not use an LLM and does not infer a root
+    cause.
+    """
+
+    restart_metrics = state.get(
+        "restart_metrics",
+        {},
+    )
+
+    total_pods = restart_metrics.get(
+        "total_pod_count",
+        0,
+    )
+
+    restarting_count = restart_metrics.get(
+        "restarting_pod_count",
+        0,
+    )
+
+    restarting_pods = restart_metrics.get(
+        "restarting_pods",
+        [],
+    )
+
+    lines = [
+        "Assessment:",
+        (
+            f"- {restarting_count} of {total_pods} inspected "
+            "pods have recorded historical container restarts."
+        ),
+    ]
+
+    if restarting_pods:
+        highest_restart_pod = restarting_pods[0]
+
+        lines.append(
+            "- The highest observed restart count is "
+            f"{highest_restart_pod.get('total_restarts')} for "
+            f"{highest_restart_pod.get('namespace')}/"
+            f"{highest_restart_pod.get('pod')}."
+        )
+
+        running_count = sum(
+            1
+            for pod in restarting_pods[:10]
+            if pod.get("phase") == "Running"
+        )
+
+        displayed_count = min(
+            len(restarting_pods),
+            10,
+        )
+
+        lines.append(
+            f"- {running_count} of the {displayed_count} "
+            "displayed high-restart pods are currently in "
+            "the Running phase."
+        )
+    else:
+        lines.append(
+            "- No pods with historical container restarts "
+            "were found."
+        )
+
+    lines.extend(
+        [
+            "",
+            "Evidence interpretation:",
+            (
+                "- Historical restart counts confirm that "
+                "container restarts occurred previously."
+            ),
+            (
+                "- Historical restart counts alone do not "
+                "prove that a workload is currently unhealthy."
+            ),
+            (
+                "- The available evidence includes pod phase "
+                "but does not include current container "
+                "readiness, waiting reasons, last termination "
+                "details, recent events, or restart-count "
+                "growth over time."
+            ),
+            "",
+            "Recommended verification:",
+            "- Check current container readiness.",
+            "- Check current container waiting reasons.",
+            (
+                "- Inspect the last terminated reason and "
+                "exit code."
+            ),
+            "- Review recent Kubernetes warning events.",
+            (
+                "- Determine whether restart counts are "
+                "continuing to increase."
+            ),
+            "",
+            "Conclusion:",
+            (
+                "- An active workload failure is not "
+                "established by the available evidence."
+            ),
+            (
+                "- Root cause cannot be determined from "
+                "the current evidence."
+            ),
+        ]
+    )
+
+    return "\n".join(lines)
+
+def validate_restart_analysis_node(
+    state: SreGraphState,
+) -> dict:
+    """
+    Validate Qwen's candidate restart analysis before allowing it
+    into the final operational report.
+
+    The candidate is rejected when it:
+    - Omits required sections
+    - Omits exact workload identifiers
+    - Introduces unsupported causal speculation
+    - Omits the root-cause disclaimer
+    - Recommends a state-changing action
+    - Is empty or excessively long
+
+    When validation fails, a deterministic safe fallback is used.
+    """
+
+    analysis = state.get(
+        "analysis",
+        "",
+    ).strip()
+
+    analysis_error = state.get(
+        "analysis_error",
+        "",
+    ).strip()
+
+    restart_metrics = state.get(
+        "restart_metrics",
+        {},
+    )
+
+    restarting_pods = restart_metrics.get(
+        "restarting_pods",
+        [],
+    )
+
+    validation_errors = []
+
+    if analysis_error:
+        validation_errors.append(
+            f"Analysis generation failed: {analysis_error}"
+        )
+
+    if not analysis:
+        validation_errors.append(
+            "Qwen returned an empty analysis."
+        )
+
+    if len(analysis) > 4000:
+        validation_errors.append(
+            "The analysis exceeded the maximum allowed length."
+        )
+
+    normalized_analysis = analysis.casefold()
+
+    required_sections = (
+        "assessment:",
+        "evidence interpretation:",
+        "recommended verification:",
+        "conclusion:",
+    )
+
+    for section in required_sections:
+        if section not in normalized_analysis:
+            validation_errors.append(
+                f"Required section is missing: {section}"
+            )
+
+    required_disclaimer = (
+        "root cause cannot be determined from "
+        "the current evidence"
+    )
+
+    if required_disclaimer not in normalized_analysis:
+        validation_errors.append(
+            "The required root-cause disclaimer is missing."
+        )
+
+    # Require exact operational identifiers for the three
+    # highest-restart workloads.
+    for pod in restarting_pods[:3]:
+        workload_identifier = (
+            f"{pod.get('namespace')}/"
+            f"{pod.get('pod')}"
+        )
+
+        if workload_identifier not in analysis:
+            validation_errors.append(
+                "Exact workload identifier was not preserved: "
+                f"{workload_identifier}"
+            )
+
+    if restarting_pods:
+        observed_phases = {
+            str(pod.get("phase"))
+            for pod in restarting_pods[:5]
+            if pod.get("phase")
+        }
+
+        for phase in observed_phases:
+            if phase.casefold() not in normalized_analysis:
+                validation_errors.append(
+                    "Observed pod phase was not acknowledged: "
+                    f"{phase}"
+                )
+
+    unsupported_causal_phrases = (
+        "resource contention",
+        "resource exhaustion",
+        "memory pressure",
+        "cpu pressure",
+        "network instability",
+        "application bugs",
+        "application bug",
+        "performance bottleneck",
+        "misconfiguration",
+        "underlying infrastructure",
+        "infrastructure instability",
+        "could indicate",
+        "may indicate",
+        "likely caused by",
+        "caused by",
+    )
+
+    for phrase in unsupported_causal_phrases:
+        if phrase in normalized_analysis:
+            validation_errors.append(
+                "Unsupported causal speculation was found: "
+                f"{phrase}"
+            )
+
+    destructive_action_phrases = (
+        "delete the pod",
+        "delete the pods",
+        "restart the pod",
+        "restart the pods",
+        "rollout restart",
+        "scale the deployment",
+        "patch the deployment",
+        "modify the deployment",
+        "cordon the node",
+        "drain the node",
+    )
+
+    for phrase in destructive_action_phrases:
+        if phrase in normalized_analysis:
+            validation_errors.append(
+                "State-changing recommendation was found: "
+                f"{phrase}"
+            )
+
+    analysis_valid = (
+        len(validation_errors) == 0
+    )
+
+    if analysis_valid:
+        validated_analysis = analysis
+    else:
+        validated_analysis = (
+            build_safe_restart_analysis(
+                state
+            )
+        )
+
+    return {
+        "analysis_valid": analysis_valid,
+        "analysis_validation_errors": (
+            validation_errors
+        ),
+        "validated_analysis": (
+            validated_analysis
+        ),
+    }
+
+
+def collect_unhealthy_metrics_node(
+    state: SreGraphState,
+) -> dict:
+    """
+    Collect information about currently unhealthy pods.
+    """
+
+    try:
+        return {
+            "unhealthy_metrics": (
+                get_unhealthy_pods()
+            )
+        }
+
+    except Exception as exc:
+        return {
+            "error": (
+                "Kubernetes pod-health diagnostics failed: "
+                f"{type(exc).__name__}: {exc}"
+            )
+        }
+
+
+def format_cpu_response_node(
+    state: SreGraphState,
+) -> dict:
+    """
+    Format CPU metrics deterministically.
+    """
+
+    if state.get("error"):
+        return {
+            "final_answer": state["error"],
+        }
+
+    nodes = state.get(
+        "cpu_metrics",
+        {},
+    ).get(
+        "nodes",
+        [],
+    )
+
+    if not nodes:
+        return {
+            "final_answer": (
+                "No Kubernetes node CPU metrics were "
+                "returned by Prometheus."
+            )
+        }
+
+    lines = [
+        "Current Kubernetes node CPU utilization:"
+    ]
+
+    for node in nodes:
+        instance = node.get("instance")
+
+        cpu_percent = node.get(
+            "cpu_utilization_percent"
+        )
+
+        if cpu_percent is None:
+            lines.append(
+                f"- {instance}: unavailable"
+            )
+        else:
+            lines.append(
+                f"- {instance}: {cpu_percent}%"
+            )
+
+    return {
+        "final_answer": "\n".join(lines),
+    }
+
+
+def format_health_response_node(
+    state: SreGraphState,
+) -> dict:
+    """
+    Format Prometheus target-health data deterministically.
+    """
+
+    if state.get("error"):
+        return {
+            "final_answer": state["error"],
+        }
+
+    health_metrics = state.get(
+        "health_metrics",
+    {},
+    )
+
+    total_count = health_metrics.get(
+        "total_target_count",
+        0,
+    )
+
+    up_count = health_metrics.get(
+        "up_target_count",
+        0,
+    )
+
+    down_count = health_metrics.get(
+        "down_target_count",
+        0,
+    )
+
+    lines = [
+        "Prometheus target health:",
+        f"- Total targets: {total_count}",
+        f"- UP targets: {up_count}",
+        f"- DOWN targets: {down_count}",
+    ]
+
+    down_targets = [
+        target
+        for target in health_metrics.get(
+            "targets",
+            [],
+        )
+        if target.get("status") == "DOWN"
+    ]
+
+    if down_targets:
+        lines.append("- Unhealthy targets:")
+
+        for target in down_targets:
+            lines.append(
+                "- "
+                f"{target.get('job')} | "
+                f"{target.get('instance')} | "
+                f"namespace="
+                f"{target.get('namespace')}"
+            )
+    else:
+        lines.append(
+            "- All discovered Prometheus targets "
+            "are UP."
+        )
+
+    return {
+        "final_answer": "\n".join(lines),
+    }
+
+
+def format_restart_response_node(
+    state: SreGraphState,
+) -> dict:
+    """
+    Format Kubernetes restart evidence together with relevant
+    knowledge retrieved from the existing Phase 2 Qdrant collection.
+
+    Exact Kubernetes values are formatted deterministically.
+    Retrieved documents are listed separately and are not treated
+    as live operational evidence.
+    """
+
+    if state.get("error"):
+        return {
+            "final_answer": state["error"],
+        }
+
+    restart_metrics = state.get(
+        "restart_metrics",
+        {},
+    )
+
+    total_pods = restart_metrics.get(
+        "total_pod_count",
+        0,
+    )
+
+    restarting_pods = restart_metrics.get(
+        "restarting_pods",
+        [],
+    )
+
+    restarting_count = restart_metrics.get(
+        "restarting_pod_count",
+        0,
+    )
+
+    retrieved_documents = state.get(
+        "retrieved_documents",
+        [],
+    )
+
+    validated_analysis = state.get(
+        "validated_analysis",
+        "",
+    ).strip()
+
+    analysis_valid = state.get(
+        "analysis_valid",
+        False,
+    )
+
+    validation_errors = state.get(
+        "analysis_validation_errors",
+        [],
+    )
+
+    lines = [
+        "Kubernetes pod restart investigation:",
+        "",
+        "Observed Kubernetes evidence:",
+        f"- Total pods inspected: {total_pods}",
+        (
+            "- Pods with one or more historical "
+            f"restarts: {restarting_count}"
+        ),
+    ]
+
+    if not restarting_pods:
+        lines.append(
+            "- No pods have recorded container restarts."
+        )
+    else:
+        lines.append(
+            "- Top pods by accumulated restart count:"
+        )
+
+        for pod in restarting_pods[:10]:
+            lines.append(
+                "- "
+                f"{pod.get('namespace')}/"
+                f"{pod.get('pod')} | "
+                f"restarts={pod.get('total_restarts')} | "
+                f"phase={pod.get('phase')} | "
+                f"node={pod.get('node')}"
+            )
+
+        lines.append(
+            "- Historical restarts do not necessarily "
+            "mean the pods are currently unhealthy."
+        )
+
+    lines.extend(
+        [
+            "",
+            "Relevant platform knowledge:",
+        ]
+    )
+
+    if not retrieved_documents:
+        lines.append(
+            "- No relevant platform documents were retrieved."
+        )
+    else:
+        for index, document in enumerate(
+            retrieved_documents,
+            start=1,
+        ):
+            lines.append(
+                f"{index}. "
+                f"[similarity={document.get('score')}] "
+                f"{document.get('text')}"
+            )
+
+    lines.extend(
+        [
+            "",
+            "Grounded Qwen analysis:",
+        ]
+    )
+
+    if validated_analysis:
+        lines.append(
+            validated_analysis
+        )
+    else:
+        lines.append(
+            "- No validated analysis was available."
+        )
+
+    lines.extend(
+        [
+            "",
+            "Analysis validation:",
+            (
+                "- Status: PASS"
+                if analysis_valid
+                else "- Status: FALLBACK USED"
+            ),
+        ]
+    )
+
+    if validation_errors:
+        lines.append(
+            "- Candidate Qwen analysis was rejected for:"
+        )
+
+        for validation_error in validation_errors:
+            lines.append(
+                f"  - {validation_error}"
+            )
+
+    return {
+        "final_answer": "\n".join(lines),
+    }
+
+def format_unhealthy_response_node(
+    state: SreGraphState,
+) -> dict:
+    """
+    Format current Kubernetes pod-health diagnostics.
+    """
+
+    if state.get("error"):
+        return {
+            "final_answer": state["error"],
+        }
+
+    unhealthy_metrics = state.get(
+        "unhealthy_metrics",
+        {},
+    )
+
+    total_pods = unhealthy_metrics.get(
+        "total_pod_count",
+        0,
+    )
+
+    unhealthy_count = unhealthy_metrics.get(
+        "unhealthy_pod_count",
+        0,
+    )
+
+    unhealthy_pods = unhealthy_metrics.get(
+        "unhealthy_pods",
+        [],
+    )
+
+    lines = [
+        "Current Kubernetes pod health:",
+        f"- Total pods inspected: {total_pods}",
+        (
+            "- Currently unhealthy pods: "
+            f"{unhealthy_count}"
+        ),
+    ]
+
+    if not unhealthy_pods:
+        lines.append(
+            "- No currently unhealthy pods were found."
+        )
+
+        return {
+            "final_answer": "\n".join(lines),
+        }
+
+    lines.append("- Unhealthy pod details:")
+
+    for pod in unhealthy_pods:
+        lines.append(
+            "- "
+            f"{pod.get('namespace')}/"
+            f"{pod.get('pod')} | "
+            f"phase={pod.get('phase')} | "
+            f"node={pod.get('node')}"
+        )
+
+        for container in pod.get(
+            "containers",
+            [],
+        ):
+            lines.append(
+                "  - "
+                f"container="
+                f"{container.get('container')} | "
+                f"ready={container.get('ready')} | "
+                f"restarts="
+                f"{container.get('restart_count')} | "
+                f"waiting_reason="
+                f"{container.get('waiting_reason')} | "
+                f"terminated_reason="
+                f"{container.get('terminated_reason')} | "
+                f"exit_code="
+                f"{container.get('exit_code')}"
+            )
+
+    return {
+        "final_answer": "\n".join(lines),
+    }
+
+
+def unsupported_question_node(
+    state: SreGraphState,
+) -> dict:
+    """
+    Return a controlled response for unsupported requests.
+    """
+
+    if state.get("error"):
+        return {
+            "final_answer": (
+                "The SRE monitoring request could not be "
+                "completed safely. Details: "
+                f"{state['error']}"
+            )
+        }
+
+    return {
+        "final_answer": (
+            "This workflow currently supports Kubernetes "
+            "node CPU usage, Prometheus target health, "
+            "historical pod restarts, and current unhealthy "
+            "pod diagnostics."
+        )
+    }
+
+
+def build_sre_monitoring_graph():
+    """
+    Build and compile the expanded SRE monitoring graph.
+    """
+
+    graph = StateGraph(SreGraphState)
+
+    graph.add_node(
+        "classify_primary_intent",
+        classify_primary_intent_node,
+    )
+
+    graph.add_node(
+        "classify_kubernetes_intent",
+        classify_kubernetes_intent_node,
+    )
+
+    graph.add_node(
+        "collect_cpu_metrics",
+        collect_cpu_metrics_node,
+    )
+
+    graph.add_node(
+        "collect_health_metrics",
+        collect_health_metrics_node,
+    )
+
+    graph.add_node(
+        "collect_restart_metrics",
+        collect_restart_metrics_node,
+    )
+
+    graph.add_node(
+        "build_restart_retrieval_query",
+        build_restart_retrieval_query_node,
+    )
+
+    graph.add_node(
+        "retrieve_restart_knowledge",
+        retrieve_restart_knowledge_node,
+    )
+
+    graph.add_node(
+        "analyze_restart_evidence",
+        analyze_restart_evidence_node,
+    )
+
+    graph.add_node(
+        "validate_restart_analysis",
+        validate_restart_analysis_node,
+    )
+
+    graph.add_node(
+        "collect_unhealthy_metrics",
+        collect_unhealthy_metrics_node,
+    )
+
+    graph.add_node(
+        "format_cpu_response",
+        format_cpu_response_node,
+    )
+
+    graph.add_node(
+        "format_health_response",
+        format_health_response_node,
+    )
+
+    graph.add_node(
+        "format_restart_response",
+        format_restart_response_node,
+    )
+
+    graph.add_node(
+        "format_unhealthy_response",
+        format_unhealthy_response_node,
+    )
+
+    graph.add_node(
+        "unsupported_question",
+        unsupported_question_node,
+    )
+
+    graph.add_edge(
+        START,
+        "classify_primary_intent",
+    )
+
+    graph.add_conditional_edges(
+        "classify_primary_intent",
+        route_primary_intent,
+        {
+            "collect_cpu_metrics": (
+                "collect_cpu_metrics"
+            ),
+            "collect_health_metrics": (
+                "collect_health_metrics"
+            ),
+            "classify_kubernetes_intent": (
+                "classify_kubernetes_intent"
+            ),
+            "unsupported_question": (
+                "unsupported_question"
+            ),
+        },
+    )
+
+    graph.add_conditional_edges(
+        "classify_kubernetes_intent",
+        route_kubernetes_intent,
+        {
+            "collect_restart_metrics": (
+                "collect_restart_metrics"
+            ),
+            "collect_unhealthy_metrics": (
+                "collect_unhealthy_metrics"
+            ),
+            "unsupported_question": (
+                "unsupported_question"
+            ),
+        },
+    )
+
+    graph.add_edge(
+        "collect_cpu_metrics",
+        "format_cpu_response",
+    )
+
+    graph.add_edge(
+        "collect_health_metrics",
+        "format_health_response",
+    )
+
+    graph.add_edge(
+        "collect_restart_metrics",
+        "build_restart_retrieval_query",
+    )
+
+    graph.add_edge(
+        "build_restart_retrieval_query",
+        "retrieve_restart_knowledge",
+    )
+
+    graph.add_edge(
+        "retrieve_restart_knowledge",
+        "analyze_restart_evidence",
+    )
+
+    graph.add_edge(
+        "analyze_restart_evidence",
+        "validate_restart_analysis",
+    )
+
+    graph.add_edge(
+        "validate_restart_analysis",
+        "format_restart_response",
+    )
+
+    graph.add_edge(
+        "collect_unhealthy_metrics",
+        "format_unhealthy_response",
+    )
+
+    graph.add_edge(
+        "format_cpu_response",
+        END,
+    )
+
+    graph.add_edge(
+        "format_health_response",
+        END,
+    )
+
+    graph.add_edge(
+        "format_restart_response",
+        END,
+    )
+
+    graph.add_edge(
+        "format_unhealthy_response",
+        END,
+    )
+
+    graph.add_edge(
+        "unsupported_question",
+        END,
+    )
+
+    return graph.compile()
+
+
+sre_monitoring_graph = build_sre_monitoring_graph()

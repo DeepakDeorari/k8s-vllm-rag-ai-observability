@@ -1,0 +1,5 @@
+kubernetes==37.0.1
+qdrant-client==1.19.1
+requests==2.34.2
+sentence-transformers==6.1.0
+transformers==5.19.0

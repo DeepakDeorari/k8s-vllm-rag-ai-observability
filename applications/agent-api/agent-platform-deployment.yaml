@@ -1,0 +1,140 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ai-sre-agent
+  namespace: agent-platform
+  labels:
+    app.kubernetes.io/name: ai-sre-agent
+    app.kubernetes.io/version: "0.1.0"
+spec:
+  replicas: 1
+
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ai-sre-agent
+
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ai-sre-agent
+        app.kubernetes.io/version: "0.1.0"
+
+    spec:
+      serviceAccountName: ai-sre-agent
+
+      # Node 2 is intentionally offline and does not have the image.
+      # Schedule this initial deployment on the active node.
+      nodeSelector:
+        kubernetes.io/hostname: ip-172-31-7-23
+
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+
+      containers:
+        - name: ai-sre-agent
+          image: ai-sre-agent:0.1.3
+          imagePullPolicy: Never
+
+          ports:
+            - name: http
+              containerPort: 8082
+              protocol: TCP
+
+          env:
+            - name: QWEN_BASE_URL
+              value: "http://vllm-qwen.vllm.svc.cluster.local:8000/v1"
+
+            - name: QWEN_MODEL
+              value: "Qwen/Qwen2.5-1.5B-Instruct"
+
+            - name: QWEN_API_KEY
+              value: "not-needed"
+
+            - name: PROMETHEUS_URL
+              value: >-
+                http://kube-prometheus-stack-prometheus.observability.svc.cluster.local:9090
+
+            - name: QDRANT_URL
+              value: "http://qdrant.qdrant.svc.cluster.local:6333"
+
+            - name: HF_HUB_DISABLE_TELEMETRY
+              value: "1"
+
+            - name: TRANSFORMERS_OFFLINE
+              value: "1"
+
+            - name: EMBEDDING_MODEL
+              value: "/app/models/all-MiniLM-L6-v2"
+
+            - name: RAY_ADDRESS
+              value: "ray://ai-sre-ray-head-svc.ray-cluster.svc.cluster.local:10001"
+
+            - name: RAY_NAMESPACE
+              value: "ai-sre-platform"
+
+            - name: RAY_KNOWLEDGE_ACTOR_NAME
+              value: "ai-sre-knowledge-v1"
+
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 30
+
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 20
+            timeoutSeconds: 3
+            failureThreshold: 3
+
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "1Gi"
+            limits:
+              cpu: "2"
+              memory: "4Gi"
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false
+            capabilities:
+              drop:
+                - ALL
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ai-sre-agent
+  namespace: agent-platform
+  labels:
+    app.kubernetes.io/name: ai-sre-agent
+spec:
+  type: ClusterIP
+
+  selector:
+    app.kubernetes.io/name: ai-sre-agent
+
+  ports:
+    - name: http
+      port: 8082
+      targetPort: http
+      protocol: TCP
